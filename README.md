@@ -36,7 +36,7 @@ CWFLY-FSD/
 | `fsd/auth.py` | 认证辅助（白名单/等级等） |
 | `fsd/config.py` | 配置解析（`fsd.conf` / `fsd-db.conf`） |
 | `fsd/db.py` | MySQL 访问：在线快照、计划落库、在线时长、航迹、审计 |
-| `fsd/weather.py` | METAR 多源（aviationweather + VATSIM + 可选 metar-taf）、OurAirports 站点库、`metar.dat` 原子写入 |
+| `fsd/weather.py` | METAR 多源、OurAirports 站点库、`metar.dat` 原子写入 |
 | `fsd/whazzup.py` | 周期生成 `whazzup.txt`（供 Little Navmap 等第三方） |
 | `fsd/management.py` | 3012 管理控制台：在线列表/踢人/广播/统计 |
 | `fsd/server_link.py` | 服务器互联协议 |
@@ -54,7 +54,7 @@ CWFLY-FSD/
 | `@` | C→S | 机组位置（姿态 PBH、应答机、地速、修正高度） |
 | `%` | C→S | 管制位置（频率、席位、视程） |
 | `'` | C→S | 管制视程点（子可见范围点，最多 3 个） |
-| `#TM` | C↔S | 文本消息（`@频率` / 点名 / `*` 全员 / `*S` 仅督导） |
+| `#TM` | C↔S | 文本消息（点对点；`server`/`*` 由服务端丢弃，不做全员广播） |
 | `$FP` | C→S | 飞行计划提交（含锁定语义） |
 | `$AM` | C→S | 管制修正计划（触发锁定并广播） |
 | `$CQ` / `$CR` | C↔S | 查询/应答（`SERVER FP` 查计划、`ATIS` 收集） |
@@ -73,6 +73,8 @@ CWFLY-FSD/
 ### 1）认证
 - **Legacy**：`#AP` 明文口令 → 直接 SHA-256 比对 → SHA-256(明文) 比对 → **bcrypt 兜底**（主站同步账号）
 - **安全认证**：`$CH` 下发挑战，客户端回 `$SA`（HMAC-SHA256(挑战, sha256(口令))）
+- **3011 默认拒绝**：`allowfrom` 为空时拒绝所有互联；`ADDCERT/KILL` 默认关闭，需显式 `control = 1`，且远端证书等级上限为 10
+- **TLS**：6809 可选配置 `tls_cert` + `tls_key`；启用后客户端必须支持 TLS。未启用时口令必须走 `$CH/$SA`，不得发送明文口令
 - 证书来源两种：`cert.txt` 文件模式 或 **MySQL 证书模式**（`fsd-db.conf`，从 `User` 表读 `fsdPasswordHash` / `password` / `fsdLevel`），每 60s 热加载
 
 ### 2）广播范围裁剪

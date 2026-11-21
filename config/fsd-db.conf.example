@@ -5,6 +5,10 @@
 clientport = 6809
 serverport = 3011
 systemport = 3012
+
+; Optional TLS for client port 6809 (both must be set; clients must support TLS)
+; tls_cert = /etc/letsencrypt/live/fsd.example.com/fullchain.pem
+; tls_key  = /etc/letsencrypt/live/fsd.example.com/privkey.pem
 certificates = cert.txt
 whazzup = whazzup.txt
 serverident = FSD-PY
@@ -22,6 +26,8 @@ user =
 password = 
 
 [connections]
+; 3011 互联控制面（ADDCERT/KILL）默认关闭；仅在有可信对端时开启
+control = 0
 
 [weather]
 source = download

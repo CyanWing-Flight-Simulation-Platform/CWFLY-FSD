@@ -16,8 +16,21 @@ logger = logging.getLogger("fsd.serverlink")
 
 class RemoteClient:
     """Wrapper for a client connected to a linked server, mimics ClientHandler interface."""
+
     def __init__(self, client: Client):
         self.client = client
+        self.client_type = client.type
+        self.callsign = client.callsign
+        self.cid = client.cid
+        self.rating = client.rating
+        self._closed = False
+
+    async def send(self, data: str) -> None:
+        """远端客户端由对端服务器投递；本地广播不应直接写此连接。"""
+        return None
+
+    def send_message(self, *args, **kwargs) -> None:
+        return None
 
 
 class ServerLink:
@@ -38,18 +51,22 @@ class ServerLink:
         # 仅靠默认绑 127.0.0.1 兜底; 一旦对外组网, 任意对端可注入证书/踢人)
         peer_ip = self.writer.get_extra_info("peername", ("", 0))[0]
         allowed = self.server.config.getlist("connections", "allowfrom") or []
-        if allowed:
-            import ipaddress
-            try:
-                if not any(ipaddress.ip_address(peer_ip) in ipaddress.ip_network(c, strict=False)
-                           for c in allowed if c):
-                    logger.warning(f"Server link rejected from {peer_ip} (not in allowfrom)")
-                    self.writer.close()
-                    return
-            except ValueError:
-                logger.warning(f"Server link allowfrom misconfigured, rejecting {peer_ip}")
+        # 安全(2026-11-20): 空 allowfrom 必须是 deny-all，不能 fail-open。
+        if not allowed:
+            logger.error("Server link rejected from %s: allowfrom is empty (default deny)", peer_ip)
+            self.writer.close()
+            return
+        import ipaddress
+        try:
+            if not any(ipaddress.ip_address(peer_ip) in ipaddress.ip_network(c, strict=False)
+                       for c in allowed if c):
+                logger.warning(f"Server link rejected from {peer_ip} (not in allowfrom)")
                 self.writer.close()
                 return
+        except ValueError:
+            logger.warning(f"Server link allowfrom misconfigured, rejecting {peer_ip}")
+            self.writer.close()
+            return
         try:
             while not self._closed:
                 data = await asyncio.wait_for(
@@ -195,28 +212,45 @@ class ServerLink:
     async def _handle_cert(self, parts: list, data: str):
         """Handle ADDCERT - certificate synchronization.
 
-        Format: cmd:cid:password_hash:level:creation:origin
-        Password is already SHA-256 hashed for security.
+        线上格式（send_cert_sync 产生）：
+          ADDCERT:<cmd_type>:<cid>:<sha256>:<level>:<creation>:<origin>
         """
-        if len(parts) >= 6:
-            from fsd.certificate import Certificate
-            cmd_type = int(parts[0]) if parts[0].isdigit() else CERT_ADD
-            cid = parts[1]
-            pwd_hash = parts[2]
-            level = int(parts[3]) if parts[3].isdigit() else 0
-            creation = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 0
-            origin = parts[5] if len(parts) > 5 else "remote"
-
-            if cmd_type == CERT_DELETE:
-                self.server.certs.remove(cid)
-                logger.info(f"Cert removed (sync): {cid}")
-            else:
-                cert = Certificate(cid, pwd_hash, level, creation, origin)
-                self.server.certs.add(cert)
-                logger.info(f"Cert synced: {cid} level={level} from {origin}")
+        if not self.server.config.link_control_enabled:
+            logger.warning("ADDCERT ignored: connections.control is disabled")
+            return
+        if len(parts) < 7:
+            return
+        from fsd.certificate import Certificate, _sanitize_cert_row, REMOTE_CERT_MAX_LEVEL
+        try:
+            cmd_type = int(parts[1])
+            cid = parts[2]
+            pwd_hash = parts[3]
+            level = int(parts[4])
+            creation = int(parts[5])
+            origin = parts[6] or "remote"
+        except (TypeError, ValueError):
+            logger.warning("ADDCERT ignored: malformed fields")
+            return
+        # 远端同步不得注入 SUP/ADM（防止互联口成为提权入口）
+        level = min(max(level, 0), REMOTE_CERT_MAX_LEVEL)
+        if cmd_type == CERT_DELETE:
+            self.server.certs.remove(cid)
+            logger.info(f"Cert removed (sync): {cid}")
+            return
+        row = _sanitize_cert_row(cid, level, pwd_hash, origin="remote", source="db", hashed=True)
+        if row is None:
+            logger.warning("ADDCERT ignored: invalid credential for %s", cid)
+            return
+        self.server.certs.add(Certificate(
+            row["cid"], row["password_hash"], row["level"],
+            creation, origin="remote", bcrypt_hash=row.get("bcrypt_hash", ""), hashed=True))
+        logger.info(f"Cert synced: {cid} level={level} from {origin}")
 
     async def _handle_kill(self, parts: list, data: str):
         """Handle KILL - disconnect a client remotely."""
+        if not self.server.config.link_control_enabled:
+            logger.warning("KILL ignored: connections.control is disabled")
+            return
         if len(parts) >= 2:
             callsign = parts[1]
             handler = self.server.get_client(callsign)
@@ -256,7 +290,10 @@ class ServerLinkManager:
                 asyncio.open_connection(host, port), timeout=10)
             link = ServerLink(self.server, reader, writer)
             self.links.append(link)
-            asyncio.create_task(link.run())
+            if hasattr(self.server, "spawn"):
+                self.server.spawn(link.run())
+            else:
+                asyncio.create_task(link.run())
             logger.info(f"Connected to server {host}:{port}")
         except Exception as e:
             logger.error(f"Failed to connect to {host}:{port}: {e}")
@@ -264,13 +301,19 @@ class ServerLinkManager:
     async def add(self, link: ServerLink):
         """Add an incoming server link."""
         self.links.append(link)
-        asyncio.create_task(link.run())
+        if hasattr(self.server, "spawn"):
+            self.server.spawn(link.run())
+        else:
+            asyncio.create_task(link.run())
 
     def broadcast(self, data: str, exclude: Optional[ServerLink] = None):
         """Broadcast data to all linked servers."""
         for link in self.links:
             if link != exclude and not link._closed:
-                asyncio.create_task(link.send(data))
+                if hasattr(self.server, "spawn"):
+                    self.server.spawn(link.send(data))
+                else:
+                    asyncio.create_task(link.send(data))
 
     def send_reset(self):
         """Send RESET to all linked servers."""

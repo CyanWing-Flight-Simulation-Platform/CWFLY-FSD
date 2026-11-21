@@ -30,12 +30,11 @@ logger = logging.getLogger("fsd.certificate")
 # 其中一条 level=12 的 000000 会直接变成管理员证书。文件证书一律不得出现
 # 管制以上等级；需要高等级账号请走 DB(user.fsdLevel) 或管理台会话内添加。
 FILE_CERT_MAX_LEVEL = int(os.environ.get("FSD_FILE_CERT_MAX_LEVEL", "2"))
+# 3011 互联证书同步的最高等级（禁止远端注入 SUP/ADM）
+REMOTE_CERT_MAX_LEVEL = int(os.environ.get("FSD_REMOTE_CERT_MAX_LEVEL", "10"))
 
-# 临时迁移应急开关（默认关闭；仅故障迁移窗口用环境变量开启，事后必须关闭）
-# - FSD_ALLOW_ANY_PASSWORD=1：已知 CID 忽略口令校验（任意口令可登录）
-# - FSD_AUTO_ADD_UNKNOWN=1：未知 CID 自动按 OBSPILOT 注册（避免 "suspended"）
-ALLOW_ANY_PASSWORD = os.environ.get("FSD_ALLOW_ANY_PASSWORD", "").strip().lower() in ("1", "true", "yes", "on")
-AUTO_ADD_UNKNOWN_CIDS = os.environ.get("FSD_AUTO_ADD_UNKNOWN", "").strip().lower() in ("1", "true", "yes", "on")
+# 安全(2026-11-20)：已彻底移除 FSD_ALLOW_ANY_PASSWORD / FSD_AUTO_ADD_UNKNOWN
+# 两个历史应急后门；即使环境变量仍存在也不会生效，启动时会输出 CRITICAL 告警。
 
 # 停用标记：DB 里可用 -1/'suspended'/'banned' 等表示停用，
 # 加载后按「已停用」处理(登录返回 (False, 0) → $ER ERR_CSSUSPEND)。
@@ -520,19 +519,9 @@ class CertificateStore:
         """
         cert = self.get(cid)
         if not cert:
-            if AUTO_ADD_UNKNOWN_CIDS:
-                cert = Certificate(cid, "", LEV_OBSPILOT, origin="emergency")
-                self.add(cert)
-                logger.warning("[Emergency] unknown CID %s auto-registered as OBSPILOT", cid)
-                cert.prev_visit = int(time.time())
-                return True, cert.level
             return False, LEV_SUSPENDED
         if getattr(cert, "suspended", False):
             return False, LEV_SUSPENDED
-        if ALLOW_ANY_PASSWORD:
-            logger.warning("[Emergency] password check bypassed for CID %s", cid)
-            cert.prev_visit = int(time.time())
-            return True, cert.level
         if cert.verify_password(password):
             cert.prev_visit = int(time.time())
             return True, cert.level
@@ -546,19 +535,9 @@ class CertificateStore:
         """
         cert = self.get(cid)
         if not cert:
-            if AUTO_ADD_UNKNOWN_CIDS:
-                cert = Certificate(cid, "", LEV_OBSPILOT, origin="emergency")
-                self.add(cert)
-                logger.warning("[Emergency] unknown CID %s auto-registered as OBSPILOT", cid)
-                cert.prev_visit = int(time.time())
-                return True, cert.level
             return False, LEV_SUSPENDED
         if getattr(cert, "suspended", False):
             return False, LEV_SUSPENDED
-        if ALLOW_ANY_PASSWORD:
-            logger.warning("[Emergency] challenge-response bypassed for CID %s", cid)
-            cert.prev_visit = int(time.time())
-            return True, cert.level
         if cert.verify_challenge(challenge, response):
             cert.prev_visit = int(time.time())
             return True, cert.level

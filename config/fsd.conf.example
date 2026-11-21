@@ -7,6 +7,10 @@ clientport = 6809
 serverport = 3011
 systemport = 3012
 
+; Optional TLS for client port 6809 (both must be set; clients must support TLS)
+; tls_cert = /etc/letsencrypt/live/fsd.example.com/fullchain.pem
+; tls_key  = /etc/letsencrypt/live/fsd.example.com/privkey.pem
+
 ; System management password (required - set a strong password!)
 ; password = change_this_password
 
@@ -27,6 +31,8 @@ serverlocation = XX
 maxclients = 500
 
 [connections]
+; 3011 互联控制面（ADDCERT/KILL）默认关闭；仅在有可信对端时开启
+control = 0
 ; Servers to connect to (colon-separated list of host:port)
 ; connectto = server1.example.com:3011:server2.example.com:3011
 

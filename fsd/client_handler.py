@@ -567,7 +567,6 @@ class ClientHandler:
         # Extract data after command prefix
         data = line[len(CL_CMD_NAMES[cmd]):]
         parts = data.split(":")
-        self.server.stats["packets_received"] += 1
 
         # Route to command handler
         handlers = {
@@ -674,12 +673,14 @@ class ClientHandler:
             return
 
         # Authenticate
+        loop = asyncio.get_running_loop()
         if self.challenge:
-            ok, max_lvl = check_login_challenge(
+            ok, max_lvl = await loop.run_in_executor(
+                None, check_login_challenge,
                 self.server.certs, cid, hmac_response, self.challenge)
         else:
-            ok, max_lvl = check_login(
-                self.server.certs, cid, hmac_response)
+            ok, max_lvl = await loop.run_in_executor(
+                None, check_login, self.server.certs, cid, hmac_response)
 
         if not ok:
             # 账号密码不匹配: 发送错误后断开连接(踢掉)
@@ -720,7 +721,7 @@ class ClientHandler:
         await self._after_auth()
 
     @staticmethod
-    def _fallback_realname(realname: str, cid: str) -> str:
+    async def _fallback_realname(realname: str, cid: str) -> str:
         """姓名兜底：客户端 Real Name 为空时改用平台用户名。
 
         安全(2026-11-07 审计 P1-10)：两条来源都做统一清洗（去 CR/LF/':'/'<>'，
@@ -731,7 +732,7 @@ class ClientHandler:
             return sanitize_realname(realname)
         try:
             from fsd.db import get_username_by_cid
-            name = get_username_by_cid(cid)
+            name = await asyncio.to_thread(get_username_by_cid, cid)
             return sanitize_realname(name) if name else ""
         except Exception:
             return ""
@@ -807,7 +808,7 @@ class ClientHandler:
         if level < 1:
             level = 1
 
-        realname = self._fallback_realname(realname, cid)
+        realname = await self._fallback_realname(realname, cid)
 
         self.cid = cid
         self.callsign = callsign
@@ -883,7 +884,7 @@ class ClientHandler:
         if level < 1:
             level = 1
 
-        realname = self._fallback_realname(realname, cid)
+        realname = await self._fallback_realname(realname, cid)
 
         self.cid = cid
         self.callsign = callsign
@@ -941,19 +942,19 @@ class ClientHandler:
                 f"{self.client.flags}")
         for cs, h in self.server.clients.items():
             if cs != self.callsign and self._client_in_range(h):
-                asyncio.ensure_future(h.send(f"@{data}\r\n"))
+                self._fire(h.send(f"@{data}\r\n"))
 
         # 在线快照: 机组位置 upsert 到 FlightPilot(节流 2s)
         if self.client and time.time() - self.client.last_snapshot > 2:
             self.client.last_snapshot = time.time()
-            asyncio.ensure_future(self._sync_pilot_snapshot())
+            self._fire(self._sync_pilot_snapshot())
 
         # ★ 航迹记录(whazzup 回放增强): 每 10s 采样一点写入 FlightTrack，
         # 供地图回放/事后核查；写库在线程池执行，不阻塞协议处理。
         try:
             if self.client and time.time() - getattr(self.client, "track_last_ts", 0) >= 10:
                 self.client.track_last_ts = time.time()
-                asyncio.ensure_future(self._record_track_point())
+                self._fire(self._record_track_point())
         except Exception:
             pass
 
@@ -1023,12 +1024,12 @@ class ClientHandler:
                 f"{self.client.lon}:{self.client.altitude}")
         for cs, h in self.server.clients.items():
             if cs != self.callsign and self._client_in_range(h):
-                asyncio.ensure_future(h.send(f"%{data}\r\n"))
+                self._fire(h.send(f"%{data}\r\n"))
 
         # 在线快照: 管制位置 upsert 到 FlightController(节流 2s)
         if self.client and time.time() - self.client.last_snapshot > 2:
             self.client.last_snapshot = time.time()
-            asyncio.ensure_future(self._sync_atc_snapshot())
+            self._fire(self._sync_atc_snapshot())
 
     async def _handle_flight_plan(self, parts: list):
         """Handle $FP - Flight plan submission.
@@ -1037,6 +1038,8 @@ class ClientHandler:
         必须容错解析，任何字段解析失败都不能断开客户端连接。
         """
         if not self.client or len(parts) < 4:
+            return
+        if not self._take("plan"):
             return
         try:
             # $FP 前缀已被 _process_line 去掉，parts[0]=callsign, parts[1]=revision, parts[2]=type
@@ -1087,14 +1090,14 @@ class ClientHandler:
                     return
                 logger.info(f"FP lock released by dep/arr change: {fp_callsign}")
                 self.server.locked_plans.discard(fp_callsign)
-                asyncio.ensure_future(self._set_plan_locked_db(fp_callsign, False))
+                self._fire(self._set_plan_locked_db(fp_callsign, False))
             self.client.plan = fp
             logger.info(f"FP: {fp_callsign} {fp.depairport}->{fp.destairport}")
 
             # 落库 + 机组主动提交触发规则广播给在线 ATC; 另 $CQ FP 请求时也可拉取
             fp.callsign = fp_callsign
-            asyncio.ensure_future(self._persist_plan(fp_callsign, fp))
-            asyncio.ensure_future(self._broadcast_plan_event(fp_callsign))
+            self._fire(self._persist_plan(fp_callsign, fp))
+            self._fire(self._broadcast_plan_event(fp_callsign))
         except Exception as e:
             # 解析失败绝不断开连接，仅记录
             logger.warning(f"FP parse error from {self.callsign}: {e}")
@@ -1106,6 +1109,8 @@ class ClientHandler:
               dest:hrsen:minen:hrsfuel:minfuel:altairport:remarks:route
         """
         if not self.client or len(parts) < 16:
+            return
+        if not self._take("plan"):
             return
         # 权限(移植自 SimpleFSD handleAtcEditPlan, 并加严):
         # 1. 仅管制员客户端可修正(此前飞行员也能改任何人的计划 — 越权漏洞)
@@ -1154,8 +1159,8 @@ class ClientHandler:
                 target.client.plan = fp
             await self._amend_plan_db(callsign, fp)
             self.server.locked_plans.add(callsign)
-            asyncio.ensure_future(self._set_plan_locked_db(callsign, True))
-            asyncio.ensure_future(self._broadcast_plan_event(callsign))
+            self._fire(self._set_plan_locked_db(callsign, True))
+            self._fire(self._broadcast_plan_event(callsign))
             try:
                 await target.send_message(
                     "SERVER", callsign,
@@ -1198,6 +1203,8 @@ class ClientHandler:
     async def _handle_message(self, parts: list):
         """Handle #TM - Text message."""
         if not self.client or len(parts) < 3:
+            return
+        if not self._take("chat"):
             return
         from_cs = parts[0]
         to_cs = parts[1]
@@ -1288,6 +1295,8 @@ class ClientHandler:
         """
         if not self.client or len(parts) < 3:
             return
+        if not self._take("chat"):
+            return
         try:
             if parts[1].upper() == "SERVER" and parts[2].upper() == "ATIS" and len(parts) >= 5:
                 if parts[3].upper() == "T":
@@ -1316,7 +1325,7 @@ class ClientHandler:
                         task = getattr(self, "_atis_broadcast_task", None)
                         if task is not None and not task.done():
                             task.cancel()
-                        self._atis_broadcast_task = asyncio.ensure_future(
+                        self._atis_broadcast_task = self._fire(
                             self._broadcast_atis_debounced())
                 return
         except Exception:
@@ -1333,8 +1342,15 @@ class ClientHandler:
         """Handle $CQ - CQ/chat request."""
         if not self.client or len(parts) < 3:
             return
+        if not self._take("query"):
+            return
         to_cs = parts[1]
         msg_type = parts[2]
+
+        # 安全(2026-11-20): 拒绝非法目标呼号，避免注入到后续 $CR/转发逻辑
+        if not to_cs or (not to_cs.startswith("@") and not is_valid_callsign(to_cs)):
+            logger.warning("CQ rejected: invalid target %r from %s", to_cs, self.callsign)
+            return
 
         if msg_type == "RN" and len(parts) >= 4:
             # Real name request
@@ -1352,7 +1368,7 @@ class ClientHandler:
 
         if msg_type == "FP" and len(parts) >= 4:
             # EuroScope 请求某机组飞行计划: 仅发送近 30 分钟提交的, 否则空 $FP
-            asyncio.ensure_future(self._reply_fp_request(parts[3]))
+            self._fire(self._reply_fp_request(parts[3]))
             return
 
     # ---- swift ACC（Aircraft Configuration）转发 ----
@@ -1542,7 +1558,7 @@ class ClientHandler:
         data = atis_text.replace("\n", "^").replace("\r", "")
         for cs, h in self.server.clients.items():
             if cs != self.callsign:
-                asyncio.ensure_future(
+                self._fire(
                     h.send(f"$AX{self.callsign}:{cs}:{data}\r\n"))
 
     async def _after_auth(self):
@@ -1571,17 +1587,17 @@ class ClientHandler:
         # 此前官网计划永远不会进入 FSD（管理端口 planadd 未实现、周期扫描被删除），
         # 只有机组自己在客户端里发 $FP 才可见 → 现在登录即自动装载并广播给在线管制员。
         if self.client_type == CLIENT_PILOT:
-            asyncio.ensure_future(self._load_filed_plan_on_login())
+            self._fire(self._load_filed_plan_on_login())
         else:
             # ★ 移植自 SimpleFSD：ATC 登录后由服务端主动索取 ATIS
             # ($CQSERVER:<cs>:ATIS → 客户端回 $CR<cs>:SERVER:ATIS:T:<text>)
             try:
-                asyncio.ensure_future(self.send(f"$CQSERVER:{self.callsign}:ATIS\r\n"))
+                self._fire(self.send(f"$CQSERVER:{self.callsign}:ATIS\r\n"))
             except Exception:
                 pass
             # 2026-11-07 临时迁移：ATC 上线主动推送在线机组计划（DB 不可用时走内存回退）
             try:
-                asyncio.ensure_future(self._broadcast_plans_from_db())
+                self._fire(self._broadcast_plans_from_db())
             except Exception:
                 pass
 
@@ -1737,7 +1753,7 @@ class ClientHandler:
                 return
             for h in self.server.clients.values():
                 if h.client_type == CLIENT_ATC:
-                    asyncio.ensure_future(h.send(line))
+                    self._fire(h.send(line))
         except Exception:
             pass
 

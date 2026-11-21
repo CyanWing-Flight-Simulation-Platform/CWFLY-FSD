@@ -42,15 +42,11 @@ systemctl enable --now cwfly-fsd.service
 
 因香港机器需等到次日，全部客户端临时切到本机；证书只有 8 月快照，无法覆盖所有当前用户，因此启用**应急认证模式**（systemd drop-in `/etc/systemd/system/cwfly-fsd-cwfly.service.d/emergency.conf`）：
 
-```ini
-[Service]
-Environment=FSD_ALLOW_ANY_PASSWORD=1
-Environment=FSD_AUTO_ADD_UNKNOWN=1
-```
+> **2026-11-20 安全整改**：应急认证后门已从代码中彻底删除，
+> `FSD_ALLOW_ANY_PASSWORD` / `FSD_AUTO_ADD_UNKNOWN` 不再生效。
+> 若 systemd drop-in `emergency.conf` 仍存在，请立即删除并重启服务。
 
-- 已知 CID：**任意密码可登录**（保留原等级）；
-- 未知 CID：自动按 `OBSPILOT(level=1)` 注册，避免 `CID/PID was suspended`；
-- 新代码开关默认关闭，只有该 drop-in 开启；**恢复 HK / 同步真实哈希后必须删除 drop-in 并重启**；
+- 历史应急模式不再可用；
 - 客户端统一地址：`fsd.cwflysim.cn:6809` 或 `160.202.241.240:6809`。
 
 ### 恢复步骤（HK 回来后）

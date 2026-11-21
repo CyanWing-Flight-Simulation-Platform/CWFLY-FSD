@@ -21,6 +21,9 @@ DEFAULT_CONFIG = {
         "preauthtimeout": "15",
         # server port(3011) 绑定地址；默认仅本机
         "server_bind": "127.0.0.1",
+        # 6809 可选 TLS（证书/key 同时配置才启用；默认关闭以兼容旧客户端）
+        "tls_cert": "",
+        "tls_key": "",
         "email": "fsd@localhost",
         "serverident": "",
         "servername": "FSD Python Server",
@@ -30,13 +33,15 @@ DEFAULT_CONFIG = {
     },
     "connections": {
         "allowfrom": "",
+        # 3011 互联控制面（ADDCERT/KILL）默认关闭；确有组网需求再显式开启
+        "control": "0",
     },
     "database": {
         "host": "127.0.0.1",
         "port": "3306",
         "name": "cwfly",
-        "user": "root",
-        "password": "password",
+        "user": "",
+        "password": "",
     },
     "weather": {
         "source": "download",
@@ -143,6 +148,18 @@ class Config:
             return max(0.0, float(val))
         except (TypeError, ValueError):
             return 0.0
+
+    @property
+    def tls_cert(self) -> str:
+        return self.get("system", "tls_cert", "") or ""
+
+    @property
+    def tls_key(self) -> str:
+        return self.get("system", "tls_key", "") or ""
+
+    @property
+    def link_control_enabled(self) -> bool:
+        return self.get("connections", "control", "0").strip().lower() in ("1", "true", "yes", "on")
 
     @property
     def server_bind(self) -> str:

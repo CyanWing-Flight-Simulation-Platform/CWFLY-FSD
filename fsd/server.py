@@ -2,6 +2,8 @@
 
 import asyncio
 import logging
+import os
+import ssl
 import time
 from typing import Optional
 
@@ -9,7 +11,7 @@ from fsd.config import Config
 from fsd.protocol import *
 from fsd.protocol import ERR_SERVFULL
 from fsd.certificate import CertificateStore, Certificate, generate_challenge
-from fsd.ratelimit import ConnectionLimiter
+from fsd.ratelimit import ConnectionLimiter, BoundedTaskGroup
 from fsd.client_handler import ClientHandler, Client, FlightPlan
 from fsd.server_link import ServerLinkManager
 from fsd.management import ManagementConsole
@@ -53,6 +55,9 @@ class FSDServer:
     def __init__(self, config: Config):
         self.config = config
         self.running = False
+        # 安全(2026-11-20): 广播/多播统一走有界任务组，避免慢客户端导致任务无限堆积
+        self.task_group = BoundedTaskGroup()
+        self._client_tasks: set[asyncio.Task] = set()
 
         # Server identity
         self.ident = config.server_ident or f"FSD{os.getpid()}"
@@ -145,8 +150,14 @@ class FSDServer:
         self.running = True
 
         # Create asyncio servers
+        client_ssl = None
+        if self.config.tls_cert and self.config.tls_key:
+            client_ssl = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            client_ssl.minimum_version = ssl.TLSVersion.TLSv1_2
+            client_ssl.load_cert_chain(self.config.tls_cert, self.config.tls_key)
+            logger.info("6809 TLS enabled (cert=%s)", self.config.tls_cert)
         self._client_server = await asyncio.start_server(
-            self._handle_client, "0.0.0.0", self.config.client_port)
+            self._handle_client, "0.0.0.0", self.config.client_port, ssl=client_ssl)
         server_bind = self.config.get("system", "server_bind", "127.0.0.1")
         self._server_server = await asyncio.start_server(
             self._handle_server, server_bind, self.config.server_port)
@@ -338,6 +349,10 @@ class FSDServer:
             except Exception as e:
                 logger.error(f"Certificate reload error: {e}")
 
+    def spawn(self, coro):
+        """有界投递协程（ClientHandler._fire / ServerLinkManager 共用）。"""
+        return self.task_group.spawn(coro)
+
     async def stop(self):
         """Gracefully shut down."""
         self.running = False
@@ -362,11 +377,46 @@ class FSDServer:
             self._loop_monitor_task.cancel()
         self.whazzup.stop()
         self.weather.stop()
+
+        # 1) 停止接收新连接，并等待监听 socket 真正关闭
+        for srv in (getattr(self, "_client_server", None),
+                    getattr(self, "_server_server", None),
+                    getattr(self, "_system_server", None)):
+            if srv is None:
+                continue
+            srv.close()
+        for srv in (getattr(self, "_client_server", None),
+                    getattr(self, "_server_server", None),
+                    getattr(self, "_system_server", None)):
+            if srv is None:
+                continue
+            try:
+                await asyncio.wait_for(srv.wait_closed(), timeout=3.0)
+            except Exception:
+                pass
+
+        # 2) 逐连接断开，让 ClientHandler 的 finally 结算 FlightLog.offlineAt
+        for handler in list(self.clients.values()):
+            handler._closed = True
+            handler._close_reason = "server_shutdown"
+            try:
+                if handler.writer is not None:
+                    handler.writer.close()
+            except Exception:
+                pass
+        for task in list(self._client_tasks):
+            task.cancel()
+        if self._client_tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*self._client_tasks, return_exceptions=True),
+                    timeout=5.0)
+            except Exception:
+                pass
+        # 3) 等待所有广播/DB 投递任务收尾
+        await self.task_group.drain(timeout=5.0)
         await self.server_links.stop()
-        self._client_server.close()
-        self._server_server.close()
-        self._system_server.close()
-        logger.info("Server stopped")
+        logger.info("Server stopped (clients drained)")
 
     async def _handle_client(self, reader: asyncio.StreamReader,
                              writer: asyncio.StreamWriter):
@@ -391,11 +441,16 @@ class FSDServer:
             except Exception:
                 pass
             return
+        task = asyncio.current_task()
+        if task is not None:
+            self._client_tasks.add(task)
         try:
             handler = ClientHandler(self, reader, writer, is_server=False)
             self.stats["connections"] += 1
             await handler.run()
         finally:
+            if task is not None:
+                self._client_tasks.discard(task)
             self.connection_limiter.release(ip)
 
     async def _handle_server(self, reader: asyncio.StreamReader,
@@ -771,5 +826,3 @@ class FSDServer:
         data = f"RMCLIENT:*:{self.ident}:U0:0:0:{client.callsign}"
         self.server_links.broadcast(data + "\r\n")
 
-
-import os  # noqa: E402 - needed for getpid in __init__

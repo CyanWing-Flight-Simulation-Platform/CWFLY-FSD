@@ -22,6 +22,7 @@ Features:
 import asyncio
 import logging
 import os
+import signal
 import sys
 
 from fsd.config import Config
@@ -54,6 +55,14 @@ async def main():
     setup_logging(debug)
     logger = logging.getLogger("fsd")
 
+    # 历史应急后门已移除；若环境里仍残留开关，启动时强告警，便于运维清理。
+    for legacy_env in ("FSD_ALLOW_ANY_PASSWORD", "FSD_AUTO_ADD_UNKNOWN"):
+        if os.environ.get(legacy_env, "").strip():
+            logger.critical(
+                "[SECURITY] %s 已废弃且不会生效；请立即从 systemd drop-in / 环境变量中移除",
+                legacy_env,
+            )
+
     # Load configuration
     config = Config(config_file)
     loaded = config.load()
@@ -83,13 +92,30 @@ async def main():
     print("  ╚══════════════════════════════════════╝")
     print()
 
+    stop_event = asyncio.Event()
+
+    def _request_stop() -> None:
+        logger.info("Shutdown signal received, draining clients...")
+        stop_event.set()
+
+    loop = asyncio.get_running_loop()
+    for sig_name in ("SIGTERM", "SIGINT"):
+        sig = getattr(signal, sig_name, None)
+        if sig is None:
+            continue
+        try:
+            loop.add_signal_handler(sig, _request_stop)
+        except (NotImplementedError, RuntimeError):
+            # Windows / 受限事件循环：退回 KeyboardInterrupt 路径
+            pass
+
     try:
         await server.start()
-        logger.info("Server is running. Press Ctrl+C to stop.")
+        logger.info("Server is running. Send SIGTERM/Ctrl+C to stop.")
 
-        # Keep running
-        while server.running:
-            await asyncio.sleep(1)
+        # Keep running until a shutdown signal arrives
+        while server.running and not stop_event.is_set():
+            await asyncio.sleep(0.5)
 
     except asyncio.CancelledError:
         pass
